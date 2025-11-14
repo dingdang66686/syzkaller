@@ -306,6 +306,8 @@ const uint64 instr_eof = -1;
 const uint64 instr_copyin = -2;
 const uint64 instr_copyout = -3;
 const uint64 instr_setprops = -4;
+const uint64 instr_seqsep = -5;
+const uint64 instr_multiseq = -6;
 
 const uint64 arg_const = 0;
 const uint64 arg_addr32 = 1;
@@ -406,6 +408,26 @@ static thread_t* last_scheduled;
 static __thread struct thread_t* current_thread;
 
 static cover_t extra_cov;
+
+// Structure to hold sequence execution context
+struct sequence_exec_ctx {
+	uint8* input_pos;
+	int call_index;
+	uint64 prog_extra_timeout;
+	uint64 prog_extra_cover_timeout;
+};
+
+// Structure for concurrent sequence execution
+struct sequence_thread_t {
+	bool created;
+	bool finished;
+	event_t done;
+	sequence_exec_ctx ctx;
+	uint64 num_calls;
+};
+
+static sequence_thread_t sequence_threads[kMaxThreads];
+static void* sequence_worker_thread(void* arg);
 
 struct res_t {
 	bool executed;
@@ -929,6 +951,168 @@ void execute_glob()
 	output_data->result_offset.store(off, std::memory_order_release);
 }
 
+// execute_sequence executes a single sequence of calls
+static void execute_sequence(sequence_exec_ctx* ctx, uint64 num_calls_in_seq)
+{
+	call_props_t call_props;
+	memset(&call_props, 0, sizeof(call_props));
+	
+	for (uint64 seq_call_idx = 0; seq_call_idx < num_calls_in_seq;) {
+		uint64 call_num = read_input(&ctx->input_pos);
+		if (call_num == instr_eof || call_num == instr_seqsep)
+			break;
+		if (call_num == instr_copyin) {
+			char* addr = (char*)(read_input(&ctx->input_pos) + SYZ_DATA_OFFSET);
+			uint64 typ = read_input(&ctx->input_pos);
+			switch (typ) {
+			case arg_const: {
+				uint64 size, bf, bf_off, bf_len;
+				uint64 arg = read_const_arg(&ctx->input_pos, &size, &bf, &bf_off, &bf_len);
+				copyin(addr, arg, size, bf, bf_off, bf_len);
+				break;
+			}
+			case arg_addr32:
+			case arg_addr64: {
+				uint64 val = read_input(&ctx->input_pos) + SYZ_DATA_OFFSET;
+				if (typ == arg_addr32)
+					NONFAILING(*(uint32*)addr = val);
+				else
+					NONFAILING(*(uint64*)addr = val);
+				break;
+			}
+			case arg_result: {
+				uint64 meta = read_input(&ctx->input_pos);
+				uint64 size = meta & 0xff;
+				uint64 bf = meta >> 8;
+				uint64 val = read_result(&ctx->input_pos);
+				copyin(addr, val, size, bf, 0, 0);
+				break;
+			}
+			case arg_data: {
+				uint64 size = read_input(&ctx->input_pos);
+				size &= ~(1ull << 63); // readable flag
+				NONFAILING(memcpy(addr, ctx->input_pos, size));
+				ctx->input_pos += (size + 7) / 8 * 8;
+				break;
+			}
+			case arg_csum: {
+				debug_verbose("checksum found at %p\n", addr);
+				uint64 size = read_input(&ctx->input_pos);
+				char* csum_addr = addr;
+				switch (read_input(&ctx->input_pos)) {
+				case arg_csum_inet: {
+					if (size != 2)
+						failmsg("bag inet checksum size", "size=%llu", size);
+					debug_verbose("calculating checksum for %p\n", csum_addr);
+					struct csum_inet csum;
+					csum_inet_init(&csum);
+					uint64 chunks_num = read_input(&ctx->input_pos);
+					for (uint64 chunk_i = 0; chunk_i < chunks_num; chunk_i++) {
+						uint64 chunk_kind = read_input(&ctx->input_pos);
+						uint64 chunk_value = read_input(&ctx->input_pos);
+						uint64 chunk_size = read_input(&ctx->input_pos);
+						switch (chunk_kind) {
+						case arg_csum_chunk_data:
+							debug_verbose("#%lld: data chunk, addr: %llx, size: %llu\n",
+								      chunk_i, chunk_value + SYZ_DATA_OFFSET, chunk_size);
+							NONFAILING(csum_inet_update(&csum, (const uint8*)(chunk_value + SYZ_DATA_OFFSET), chunk_size));
+							break;
+						case arg_csum_chunk_const:
+							if (chunk_size != 2 && chunk_size != 4 && chunk_size != 8)
+								failmsg("bad checksum const chunk size", "size=%lld", chunk_size);
+							debug_verbose("#%lld: const chunk, value: %llx, size: %llu\n",
+								      chunk_i, chunk_value, chunk_size);
+							csum_inet_update(&csum, (const uint8*)&chunk_value, chunk_size);
+							break;
+						default:
+							failmsg("bad checksum chunk kind", "kind=%llu", chunk_kind);
+						}
+					}
+					uint16 csum_value = csum_inet_digest(&csum);
+					debug_verbose("writing inet checksum %hx to %p\n", csum_value, csum_addr);
+					NONFAILING(memcpy(csum_addr, &csum_value, sizeof(csum_value)));
+					break;
+				}
+				default:
+					failmsg("bad checksum kind", "kind=%llu", read_input(&ctx->input_pos));
+				}
+				break;
+			}
+			default:
+				failmsg("bad argument type", "type=%llu", typ);
+			}
+			continue;
+		}
+		if (call_num == instr_copyout) {
+			read_input(&ctx->input_pos); // index
+			read_input(&ctx->input_pos); // addr
+			continue;
+		}
+		if (call_num == instr_setprops) {
+			read_call_props_t(call_props, read_input(&ctx->input_pos, false));
+			continue;
+		}
+
+		// Normal syscall.
+		if (call_num >= ARRAY_SIZE(syscalls))
+			failmsg("invalid syscall number", "call_num=%llu", call_num);
+		const call_t* call = &syscalls[call_num];
+		if (ctx->prog_extra_timeout < call->attrs.prog_timeout)
+			ctx->prog_extra_timeout = call->attrs.prog_timeout * slowdown_scale;
+		if (call->attrs.remote_cover)
+			ctx->prog_extra_cover_timeout = 500 * slowdown_scale;
+		uint64 copyout_index = read_input(&ctx->input_pos);
+		uint64 num_args = read_input(&ctx->input_pos);
+		if (num_args > kMaxArgs)
+			failmsg("command has bad number of arguments", "args=%llu", num_args);
+		uint64 args[kMaxArgs] = {};
+		for (uint64 i = 0; i < num_args; i++)
+			args[i] = read_arg(&ctx->input_pos);
+		for (uint64 i = num_args; i < kMaxArgs; i++)
+			args[i] = 0;
+		thread_t* th = schedule_call(ctx->call_index++, call_num, copyout_index,
+					     num_args, args, ctx->input_pos, call_props);
+
+		if (call_props.async && flag_threaded) {
+			// Don't wait for an async call to finish. We'll wait at the end.
+		} else if (flag_threaded) {
+			// Wait for call completion.
+			uint64 timeout_ms = syscall_timeout_ms + call->attrs.timeout * slowdown_scale;
+			if (flag_debug && timeout_ms < 1000)
+				timeout_ms = 1000;
+			if (event_timedwait(&th->done, timeout_ms))
+				handle_completion(th);
+
+			// Check if any of previous calls have completed.
+			for (int i = 0; i < kMaxThreads; i++) {
+				th = &threads[i];
+				if (th->executing && event_isset(&th->done))
+					handle_completion(th);
+			}
+		} else {
+			// Execute directly.
+			if (th != &threads[0])
+				fail("using non-main thread in non-thread mode");
+			event_reset(&th->ready);
+			execute_call(th);
+			event_set(&th->done);
+			handle_completion(th);
+		}
+		memset(&call_props, 0, sizeof(call_props));
+		seq_call_idx++;
+	}
+}
+
+// sequence_worker_thread executes a sequence in a separate thread
+static void* sequence_worker_thread(void* arg)
+{
+	sequence_thread_t* seq_th = (sequence_thread_t*)arg;
+	execute_sequence(&seq_th->ctx, seq_th->num_calls);
+	seq_th->finished = true;
+	event_set(&seq_th->done);
+	return nullptr;
+}
+
 // execute_one executes program stored in input_data.
 void execute_one()
 {
@@ -969,11 +1153,48 @@ void execute_one()
 	call_props_t call_props;
 	memset(&call_props, 0, sizeof(call_props));
 
-	read_input(&input_pos); // total number of calls
-	for (;;) {
-		uint64 call_num = read_input(&input_pos);
-		if (call_num == instr_eof)
-			break;
+	uint64 first_val = read_input(&input_pos);
+	
+	// Check if this is a multi-sequence program
+	bool is_multi_sequence = (first_val == instr_multiseq);
+	
+	if (is_multi_sequence && flag_threaded) {
+		// Multi-sequence execution: execute all sequences concurrently
+		uint64 num_sequences = read_input(&input_pos);
+		debug("executing %llu sequences concurrently\n", num_sequences);
+		
+		// Execute each sequence with its calls marked as async (except the last call in each)
+		for (uint64 seq_idx = 0; seq_idx < num_sequences; seq_idx++) {
+			sequence_exec_ctx ctx;
+			ctx.input_pos = input_pos;
+			ctx.call_index = call_index;
+			ctx.prog_extra_timeout = prog_extra_timeout;
+			ctx.prog_extra_cover_timeout = prog_extra_cover_timeout;
+			
+			uint64 num_calls_in_seq = read_input(&ctx.input_pos);
+			execute_sequence(&ctx, num_calls_in_seq);
+			
+			// Update global state
+			input_pos = ctx.input_pos;
+			call_index = ctx.call_index;
+			if (prog_extra_timeout < ctx.prog_extra_timeout)
+				prog_extra_timeout = ctx.prog_extra_timeout;
+			if (prog_extra_cover_timeout < ctx.prog_extra_cover_timeout)
+				prog_extra_cover_timeout = ctx.prog_extra_cover_timeout;
+			
+			// Check for sequence separator (except after last sequence)
+			if (seq_idx < num_sequences - 1) {
+				uint64 sep = read_input(&input_pos);
+				if (sep != instr_seqsep)
+					failmsg("expected sequence separator", "got=%llu", sep);
+			}
+		}
+	} else {
+		// Legacy single sequence execution
+		for (;;) {
+			uint64 call_num = read_input(&input_pos);
+			if (call_num == instr_eof)
+				break;
 		if (call_num == instr_copyin) {
 			char* addr = (char*)(read_input(&input_pos) + SYZ_DATA_OFFSET);
 			uint64 typ = read_input(&input_pos);

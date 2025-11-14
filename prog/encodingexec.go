@@ -33,6 +33,8 @@ const (
 	execInstrCopyin
 	execInstrCopyout
 	execInstrSetProps
+	execInstrSeqSep      // Sequence separator for concurrent execution
+	execInstrMultiSeq    // Marker for multi-sequence program
 )
 
 const (
@@ -72,13 +74,34 @@ func (p *Prog) SerializeForExec() ([]byte, error) {
 		buf:    make([]byte, 0, 4<<10),
 		args:   make(map[Arg]argInfo),
 	}
-	w.write(uint64(len(p.Calls)))
-	for _, c := range p.Calls {
-		w.csumMap, w.csumUses = calcChecksumsCall(c)
-		// TODO: if we propagate this error, something breaks and no coverage
-		// is displayed to the dashboard or the logs.
-		_ = w.serializeCall(c)
+	
+	// Handle both single sequence (legacy) and multi-sequence programs
+	if p.HasSequences() {
+		// Multi-sequence format: marker, num_sequences, then each sequence
+		w.write(execInstrMultiSeq)        // Marker for multi-sequence
+		w.write(uint64(len(p.Sequences))) // Number of sequences
+		for seqIdx, seq := range p.Sequences {
+			w.write(uint64(len(seq))) // Number of calls in this sequence
+			for _, c := range seq {
+				w.csumMap, w.csumUses = calcChecksumsCall(c)
+				_ = w.serializeCall(c)
+			}
+			// Write sequence separator (except after last sequence)
+			if seqIdx < len(p.Sequences)-1 {
+				w.write(execInstrSeqSep)
+			}
+		}
+	} else {
+		// Legacy single sequence format
+		w.write(uint64(len(p.Calls)))
+		for _, c := range p.Calls {
+			w.csumMap, w.csumUses = calcChecksumsCall(c)
+			// TODO: if we propagate this error, something breaks and no coverage
+			// is displayed to the dashboard or the logs.
+			_ = w.serializeCall(c)
+		}
 	}
+	
 	w.write(execInstrEOF)
 	if len(w.buf) > ExecBufferSize {
 		return nil, fmt.Errorf("encodingexec: too large program (%v/%v)", len(w.buf), ExecBufferSize)

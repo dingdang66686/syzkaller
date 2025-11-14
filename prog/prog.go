@@ -16,6 +16,11 @@ type Prog struct {
 
 	// Was deserialized using Unsafe mode, so can do unsafe things.
 	isUnsafe bool
+
+	// Sequences represents multiple call sequences for concurrent execution.
+	// When Sequences is non-empty, each sequence will be executed in a separate thread.
+	// For backward compatibility, if Sequences is empty, Calls is used as a single sequence.
+	Sequences [][]*Call
 }
 
 const ExtraCallName = ".extra"
@@ -50,6 +55,31 @@ func (p *Prog) FilterInplace(allowed map[*Syscall]bool) {
 		}
 		i++
 	}
+}
+
+// HasSequences returns true if the program uses multiple concurrent sequences.
+func (p *Prog) HasSequences() bool {
+	return len(p.Sequences) > 0
+}
+
+// AllCalls returns all calls in the program, whether from Calls or Sequences.
+func (p *Prog) AllCalls() []*Call {
+	if p.HasSequences() {
+		var allCalls []*Call
+		for _, seq := range p.Sequences {
+			allCalls = append(allCalls, seq...)
+		}
+		return allCalls
+	}
+	return p.Calls
+}
+
+// NumSequences returns the number of sequences (1 for single sequence progs).
+func (p *Prog) NumSequences() int {
+	if p.HasSequences() {
+		return len(p.Sequences)
+	}
+	return 1
 }
 
 // These properties are parsed and serialized according to the tag and the type
@@ -597,7 +627,8 @@ func FormatArg(arg Arg, name string) []string {
 }
 
 func (p *Prog) sanitize(fix bool) error {
-	for _, c := range p.Calls {
+	// Sanitize all calls regardless of whether they're in Calls or Sequences
+	for _, c := range p.AllCalls() {
 		if err := p.Target.sanitize(c, fix); err != nil {
 			return err
 		}

@@ -33,3 +33,50 @@ func (target *Target) Generate(rs rand.Source, ncalls int, ct *ChoiceTable) *Pro
 	p.debugValidate()
 	return p
 }
+
+// GenerateConcurrent generates a random program with multiple sequences for concurrent execution.
+// Each sequence will have approximately ncalls/numSequences calls.
+// ct contains a set of allowed syscalls, if nil all syscalls are used.
+func (target *Target) GenerateConcurrent(rs rand.Source, ncalls int, numSequences int, ct *ChoiceTable) *Prog {
+	if numSequences <= 1 {
+		return target.Generate(rs, ncalls, ct)
+	}
+	
+	p := &Prog{
+		Target:    target,
+		Sequences: make([][]*Call, numSequences),
+	}
+	r := newRand(target, rs)
+	
+	// Distribute calls across sequences
+	callsPerSeq := ncalls / numSequences
+	remainder := ncalls % numSequences
+	
+	for seqIdx := 0; seqIdx < numSequences; seqIdx++ {
+		s := newState(target, ct, nil)
+		seqLen := callsPerSeq
+		if seqIdx < remainder {
+			seqLen++
+		}
+		
+		var calls []*Call
+		for len(calls) < seqLen {
+			generatedCalls := r.generateCall(s, p, len(calls))
+			for _, c := range generatedCalls {
+				s.analyze(c)
+				calls = append(calls, c)
+			}
+		}
+		
+		// Trim excess calls
+		if len(calls) > seqLen {
+			calls = calls[:seqLen]
+		}
+		
+		p.Sequences[seqIdx] = calls
+	}
+	
+	p.sanitizeFix()
+	p.debugValidate()
+	return p
+}
