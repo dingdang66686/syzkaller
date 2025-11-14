@@ -417,17 +417,7 @@ struct sequence_exec_ctx {
 	uint64 prog_extra_cover_timeout;
 };
 
-// Structure for concurrent sequence execution
-struct sequence_thread_t {
-	bool created;
-	bool finished;
-	event_t done;
-	sequence_exec_ctx ctx;
-	uint64 num_calls;
-};
 
-static sequence_thread_t sequence_threads[kMaxThreads];
-static void* sequence_worker_thread(void* arg);
 
 struct res_t {
 	bool executed;
@@ -1103,16 +1093,6 @@ static void execute_sequence(sequence_exec_ctx* ctx, uint64 num_calls_in_seq)
 	}
 }
 
-// sequence_worker_thread executes a sequence in a separate thread
-static void* sequence_worker_thread(void* arg)
-{
-	sequence_thread_t* seq_th = (sequence_thread_t*)arg;
-	execute_sequence(&seq_th->ctx, seq_th->num_calls);
-	seq_th->finished = true;
-	event_set(&seq_th->done);
-	return nullptr;
-}
-
 // execute_one executes program stored in input_data.
 void execute_one()
 {
@@ -1345,6 +1325,7 @@ void execute_one()
 			handle_completion(th);
 		}
 		memset(&call_props, 0, sizeof(call_props));
+		}
 	}
 
 	if (running > 0) {

@@ -59,21 +59,26 @@ func (target *Target) GenerateConcurrent(rs rand.Source, ncalls int, numSequence
 			seqLen++
 		}
 		
-		var calls []*Call
-		for len(calls) < seqLen {
-			generatedCalls := r.generateCall(s, p, len(calls))
+		// Create a temporary prog for generating this sequence
+		tempProg := &Prog{
+			Target: target,
+			Calls:  []*Call{},
+		}
+		
+		for len(tempProg.Calls) < seqLen {
+			generatedCalls := r.generateCall(s, tempProg, len(tempProg.Calls))
 			for _, c := range generatedCalls {
 				s.analyze(c)
-				calls = append(calls, c)
+				tempProg.Calls = append(tempProg.Calls, c)
 			}
 		}
 		
 		// Trim excess calls
-		if len(calls) > seqLen {
-			calls = calls[:seqLen]
+		if len(tempProg.Calls) > seqLen {
+			tempProg.Calls = tempProg.Calls[:seqLen]
 		}
 		
-		p.Sequences[seqIdx] = calls
+		p.Sequences[seqIdx] = tempProg.Calls
 	}
 	
 	p.sanitizeFix()
